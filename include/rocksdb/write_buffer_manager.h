@@ -19,6 +19,7 @@
 #include <mutex>
 #include <vector>
 #include <iostream>
+#include <fstream>
 #include "rocksdb/cache.h"
 #include "rocksdb/tg_thread_local.h"
 
@@ -61,21 +62,6 @@ class WriteBufferManager final {
 
   ~WriteBufferManager();
 
-  // TODO(tgriggs): update this based on column family IDs
-  int ClientId2ClientIdx(int client_id) const {
-    if (client_id > 0) {
-      return client_id - 1;
-    }
-    return client_id;
-  }
-
-  int ClientIdx2ClientId(int client_idx) const {
-    if (client_idx >= 0) {
-      return client_idx + 1;
-    }
-    return client_idx;
-  }
-
   // Returns true if buffer_limit is passed to limit the total memory usage and
   // is greater than 0.
   bool enabled() const { return buffer_size() > 0; }
@@ -91,8 +77,7 @@ class WriteBufferManager final {
 
   // Returns the per-client memory usage.
   size_t per_client_memory_usage(int client_id) const {
-    int client_idx = ClientId2ClientIdx(client_id);
-    return per_client_memory_used_[client_idx].load(std::memory_order_relaxed);
+    return per_client_memory_used_[client_id].load(std::memory_order_relaxed);
   }
 
   // Returns the total memory used by active memtables.
@@ -157,26 +142,15 @@ bool ShouldFlush() const {
   // WriteBufferManager instance creation.
   //
   // Should only be called by RocksDB internally.
-  bool ShouldStall(int client_id) const {
-    if (!allow_stall_.load(std::memory_order_relaxed) || !enabled()) {
-      return false;
-    }
-
-  return IsStallActive(client_id) || IsStallThresholdExceeded(client_id);
-}
+  bool ShouldStall(int client_id) const;
 
   // Returns true if stall is active for the given client.
   bool IsStallActive(int client_id) const {
-    int client_idx = ClientId2ClientIdx(client_id);
-    return per_client_stall_active_[client_idx].load(std::memory_order_relaxed);
+    return per_client_stall_active_[client_id].load(std::memory_order_relaxed);
   }
 
   // Returns true if stalling condition is met for the given client.
-  bool IsStallThresholdExceeded(int client_id) const {
-    int client_idx = ClientId2ClientIdx(client_id);
-    return per_client_memory_used_[client_idx].load(std::memory_order_relaxed) >=
-           per_client_buffer_size_[client_idx];
-  }
+  bool IsStallThresholdExceeded(int client_id) const;
 
   void ReserveMem(size_t mem);
 
@@ -215,6 +189,12 @@ bool ShouldFlush() const {
   // Value should only be changed by BeginWriteStall() and MaybeEndWriteStall()
   // while holding mu_, but it can be read without a lock.
   std::vector<std::atomic<bool>> per_client_stall_active_;
+
+  std::ofstream mt_log_file_;
+
+  std::vector<std::atomic<size_t>> per_client_stall_count_;
+  std::atomic<int> total_stall_count_;
+
 
   void ReserveMemWithCache(size_t mem);
   void FreeMemWithCache(size_t mem);

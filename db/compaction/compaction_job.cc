@@ -640,18 +640,9 @@ int TG_StringKeyToIntKey(std::string key) {
 }
 
 void TG_SetThreadMetadata(std::string key) {
+  (void) key;
   auto& thread_metadata = TG_GetThreadMetadata();
-  int key_num = TG_StringKeyToIntKey(key);
-  if (key_num == -2) {
-    thread_metadata.client_id = -2;
-    return;
-  }
-
-  // TODO(tgriggs): update Client ID determination
-  int client_id = key_num / (6250000 / 4) + 1;
-
-  thread_metadata.client_id = client_id;
-  return;
+  thread_metadata.client_id = -2;
 }
 
 Status CompactionJob::Run() {
@@ -1542,7 +1533,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                                              close_file_func);
 
   auto& thread_metadata = TG_GetThreadMetadata();
-  thread_metadata.client_id = 0;
+  thread_metadata.client_id = -1;
 
   if (blob_file_builder) {
     if (status.ok()) {
