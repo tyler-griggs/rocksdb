@@ -546,6 +546,8 @@ class Cache {
   // or destruction, guaranteed before or after any thread-shared operations.
   void SetEvictionCallback(EvictionCallback&& fn);
 
+  void* manager = nullptr;
+
  protected:
   std::shared_ptr<MemoryAllocator> memory_allocator_;
   EvictionCallback eviction_callback_;
