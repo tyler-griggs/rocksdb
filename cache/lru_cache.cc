@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "rocksdb/cache.h"
 #include "cache/lru_cache.h"
 
 #include <cassert>
@@ -20,8 +21,126 @@
 #include "port/lang.h"
 #include "util/distributed_mutex.h"
 
+#include <chrono>
+#include <ctime>
+
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
+
+long get_current_time () {
+  // Get the current time as a time_point
+  auto now = std::chrono::system_clock::now();
+  
+  // Convert to a time_point representing the duration since epoch
+  auto duration = now.time_since_epoch();
+  
+  // Convert to milliseconds
+  auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
+  return milliseconds.count();
+}
+
+static LRUCacheManager* lru_cache_manager = nullptr;
+
+LRUCacheManager::LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts) :
+    request_additional_delay_microseconds(request_additional_delay_microseconds_),
+    read_io_mbps(read_io_mbps_),
+    additional_bursting_supported(K) {
+  manager_mutex_ = new rocksdb::DMutex(true);
+  caches = new std::map<int, FairDBCacheMetadata*> ();
+  opts.manager_ptr = this;
+  main_cache = std::make_shared<LRUCache>(opts);
+}
+
+FairDBCacheMetadata* LRUCacheManager::AddCache (int client_id) {
+  FairDBCacheMetadata* metadata = new FairDBCacheMetadata;
+  metadata->capacity = 0;
+  metadata->reserved_capacity = 0;
+  metadata->hit_ctr = 0;
+  metadata->miss_ctr = 0;
+  metadata->client_id = client_id;
+  //printf("Added cache space to pool for client id %d\n", client_id);
+  caches->emplace(client_id, metadata);
+  return metadata;
+}
+
+FairDBCacheMetadata* LRUCacheManager::GetElement (int client_id) {
+  auto element_it = caches->find(client_id);
+  if (element_it == caches->end()) {
+    return nullptr;
+  }
+  FairDBCacheMetadata* element = element_it->second;
+  return element;
+}
+
+void LRUCacheManager::IncrementAllocation (int client_id, size_t capacity) {
+  if (client_id == -1) return;
+  FairDBCacheMetadata* element = GetElement(client_id);
+  assert (element != nullptr);
+  //printf("Incr client %d: %d bytes. Is at %d, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
+  element->capacity += capacity;
+}
+
+size_t LRUCacheManager::DecrementAllocation (int client_id, size_t capacity) {
+  if (client_id == -1) return 0;
+  FairDBCacheMetadata* element = GetElement(client_id);
+  assert (element != nullptr);
+  //printf("Decr client %d: %d bytes. Is at %d, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
+  if (element->capacity > capacity) {
+    element->capacity -= capacity;
+    return capacity;
+  } else {
+    size_t change = element->capacity;
+    element->capacity = 0;
+    return change;
+  }
+}
+
+void LRUCacheManager::MarkActiveUser (int client_id) {
+  // TODO (devbali): Implement a way to have user be deactivated too
+  if (client_id == -1) return;
+
+  if (active_users.find(client_id) == active_users.end()) {
+    // client id not in active users
+    DMutex* manager_mutex__ = (DMutex*) manager_mutex_;
+    DMutexLock l(*manager_mutex__);
+    active_users.emplace(client_id);
+
+    size_t N = caches->size();
+    size_t TOTAL = main_cache->GetCapacity();
+    size_t K = additional_bursting_supported;
+    size_t M = active_users.size();
+    // RAD = (40-R) * 1/(1600 / (M + 2))
+    // TOTAL/N - R = RAD * (rio / M + 2)
+    // TOTAL/N - RAD * (rio / M + 2) = R
+
+    if (M + K == 0 || N == 0) {
+      return;
+    }
+
+    ssize_t reserved_needed = TOTAL / N 
+      - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / (M + K);
+    
+    if (reserved_needed < 0) {
+      current_reservation_standard_ = 0;
+    } else {
+      current_reservation_standard_ = reserved_needed;
+    }
+    
+    for (auto caches_iterator = caches->begin(); caches_iterator != caches->end(); ++caches_iterator) {
+      FairDBCacheMetadata* meta = caches_iterator->second;
+      meta->reserved_capacity = current_reservation_standard_;
+    }
+    printf("Added an active user. Number of active users now is %d. The reserved capacity standard now is %d\n", M, current_reservation_standard_);
+  }
+}
+
+LRUCacheManager::~LRUCacheManager () {
+  for (std::map<int, FairDBCacheMetadata*>::iterator it = caches->begin(); it != caches->end(); ++it) {
+    delete it->second;
+  }
+
+  delete caches;
+}
 
 LRUHandleTable::LRUHandleTable(int max_upper_hash_bits,
                                MemoryAllocator* allocator)
@@ -120,7 +239,9 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                              CacheMetadataChargePolicy metadata_charge_policy,
                              int max_upper_hash_bits,
                              MemoryAllocator* allocator,
-                             const Cache::EvictionCallback* eviction_callback)
+                             const Cache::EvictionCallback* eviction_callback,
+                             LRUCacheManager* lru_manager,
+                             std::atomic<uint64_t>* hit_ctr, std::atomic<uint64_t>* miss_ctr)
     : CacheShardBase(metadata_charge_policy),
       capacity_(0),
       high_pri_pool_usage_(0),
@@ -134,7 +255,10 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       usage_(0),
       lru_usage_(0),
       mutex_(use_adaptive_mutex),
-      eviction_callback_(*eviction_callback) {
+      eviction_callback_(*eviction_callback),
+      lru_manager_ (lru_manager),
+      hit_ctr_ (hit_ctr),
+      miss_ctr_ (miss_ctr) {
   // Make empty circular linked list.
   lru_.next = &lru_;
   lru_.prev = &lru_;
@@ -252,6 +376,8 @@ void LRUCacheShard::LRU_Remove(LRUHandle* e) {
     assert(low_pri_pool_usage_ >= e->total_charge);
     low_pri_pool_usage_ -= e->total_charge;
   }
+  if (lru_manager_)
+    lru_manager_->DecrementAllocation(e->client_id, e->total_charge);
 }
 
 void LRUCacheShard::LRU_Insert(LRUHandle* e) {
@@ -293,6 +419,9 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     }
     lru_bottom_pri_ = e;
   }
+  // Add this amount to the manager counts
+  if (lru_manager_)
+    lru_manager_->IncrementAllocation(e->client_id, e->total_charge);
   lru_usage_ += e->total_charge;
 }
 
@@ -323,10 +452,23 @@ void LRUCacheShard::MaintainPoolSize() {
 
 void LRUCacheShard::EvictFromLRU(size_t charge,
                                  autovector<LRUHandle*>* deleted) {
-  while ((usage_ + charge) > capacity_ && lru_.next != &lru_) {
-    LRUHandle* old = lru_.next;
+  LRUHandle* head = &lru_;
+  while ((usage_ + charge) > capacity_ && head->next != &lru_) {
+    LRUHandle* old = head->next;
     // LRU list contains only elements which can be evicted.
     assert(old->InCache() && !old->HasRefs());
+
+    if (lru_manager_) {
+      FairDBCacheMetadata* old_meta = lru_manager_->GetElement(old->client_id);
+      //printf("checking old client %d for reserving: %d < %d\n", old->client_id, (int) old_meta->capacity, (int) old_meta->reserved_capacity);
+      if (old_meta->capacity < old_meta->reserved_capacity) {
+        head = old;
+        continue;
+      }
+    }
+
+    //printf("Deleting old for client %d\n", old->client_id);
+
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
@@ -334,6 +476,7 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     usage_ -= old->total_charge;
     deleted->push_back(old);
   }
+
 }
 
 void LRUCacheShard::NotifyEvicted(
@@ -433,6 +576,9 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
                                  Cache::CreateContext* /*create_context*/,
                                  Cache::Priority /*priority*/,
                                  Statistics* /*stats*/) {
+  TGThreadMetadata& thread_metadata = TG_GetThreadMetadata();
+  int client_id = thread_metadata.client_id;
+
   DMutexLock l(mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
@@ -444,6 +590,21 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
     }
     e->Ref();
     e->SetHit();
+    (*hit_ctr_)++;
+    if (lru_manager_) {
+      FairDBCacheMetadata* element = lru_manager_->GetElement(client_id);
+      if (element) {
+        element->hit_ctr++;
+      }
+    }
+  } else {
+    (*miss_ctr_)++;
+    if (lru_manager_) {
+      FairDBCacheMetadata* element = lru_manager_->GetElement(client_id);
+      if (element) {
+        element->miss_ctr++;
+      }
+    }
   }
   return e;
 }
@@ -484,8 +645,13 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
     if (must_free && was_in_cache) {
       // The item is still in cache, and nobody else holds a reference to it.
       if (usage_ > capacity_ || erase_if_last_ref) {
+
+        // TODO: this was assuming a cache will never be resized to being below its original size
+        // Look for more such assumptions
+
         // The LRU list must be empty since the cache is full.
-        assert(lru_.next == &lru_ || erase_if_last_ref);
+        //assert(lru_.next == &lru_ || erase_if_last_ref);
+
         // Take this opportunity and remove the item.
         table_.Remove(e->key(), e->hash);
         e->SetInCache(false);
@@ -521,7 +687,7 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
 LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
                                        Cache::ObjectPtr value,
                                        const Cache::CacheItemHelper* helper,
-                                       size_t charge) {
+                                       size_t charge, int client_id) {
   assert(helper);
   // value == nullptr is reserved for indicating failure in SecondaryCache
   assert(!(helper->IsSecondaryCacheCompatible() && value == nullptr));
@@ -532,6 +698,7 @@ LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
   LRUHandle* e =
       static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
 
+  e->client_id = client_id;
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
@@ -551,7 +718,12 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash,
                              const Cache::CacheItemHelper* helper,
                              size_t charge, LRUHandle** handle,
                              Cache::Priority priority) {
-  LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  TGThreadMetadata& thread_metadata = TG_GetThreadMetadata();
+  int client_id = thread_metadata.client_id;
+  if (lru_manager_) {
+    lru_manager_->MarkActiveUser(client_id);
+  }
+  LRUHandle* e = CreateHandle(key, hash, value, helper, charge, client_id);
   e->SetPriority(priority);
   e->SetInCache(true);
   return InsertItem(e, handle);
@@ -562,7 +734,7 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
                                            const Cache::CacheItemHelper* helper,
                                            size_t charge,
                                            bool allow_uncharged) {
-  LRUHandle* e = CreateHandle(key, hash, value, helper, charge);
+  LRUHandle* e = CreateHandle(key, hash, value, helper, charge, -1);
   e->SetIsStandalone(true);
   e->Ref();
 
@@ -649,7 +821,9 @@ void LRUCacheShard::AppendPrintableOptions(std::string& str) const {
   str.append(buffer);
 }
 
-LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts) {
+LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts), 
+manager_ptr_(opts.manager_ptr), client_id_ (opts.client_id), hit_ctr_(0), miss_ctr_(0) {
+  manager = opts.manager_ptr;
   size_t per_shard = GetPerShardCapacity();
   MemoryAllocator* alloc = memory_allocator();
   InitShards([&](LRUCacheShard* cs) {
@@ -657,8 +831,9 @@ LRUCache::LRUCache(const LRUCacheOptions& opts) : ShardedCache(opts) {
                            opts.high_pri_pool_ratio, opts.low_pri_pool_ratio,
                            opts.use_adaptive_mutex, opts.metadata_charge_policy,
                            /* max_upper_hash_bits */ 32 - opts.num_shard_bits,
-                           alloc, &eviction_callback_);
+                           alloc, &eviction_callback_, opts.manager_ptr, &hit_ctr_, &miss_ctr_);
   });
+  
 }
 
 Cache::ObjectPtr LRUCache::Value(Handle* handle) {
@@ -707,6 +882,14 @@ std::shared_ptr<Cache> LRUCacheOptions::MakeSharedCache() const {
   LRUCacheOptions opts = *this;
   if (opts.num_shard_bits < 0) {
     opts.num_shard_bits = GetDefaultCacheShardBits(capacity);
+  }
+
+  if (opts.fairdb_use_pooled) {
+    if (rocksdb::lru_cache::lru_cache_manager == nullptr) {
+      rocksdb::lru_cache::lru_cache_manager = new rocksdb::lru_cache::LRUCacheManager(opts.request_additional_delay_microseconds, opts.read_io_mbps, opts.additional_rampups_supported, opts);
+    }
+    rocksdb::lru_cache::lru_cache_manager->AddCache(opts.client_id);
+    return rocksdb::lru_cache::lru_cache_manager->GetMainCache();
   }
   std::shared_ptr<Cache> cache = std::make_shared<LRUCache>(opts);
   if (secondary_cache) {
