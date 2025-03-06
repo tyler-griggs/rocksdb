@@ -18,7 +18,6 @@
 * Add new experimental `TransactionOptions::large_txn_commit_optimize_byte_threshold` to enable optimizations for large transaction commit by transaction batch data size.
 * Add a new option `CompactionOptionsUniversal::reduce_file_locking` and if it's true, auto universal compaction picking will adjust to minimize locking of input files when bottom priority compactions are waiting to run. This can increase the likelihood of existing L0s being selected for compaction, thereby improving write stall and reducing read regression.
 * Add new `format_version=7` to aid experimental support of custom compression algorithms with CompressionManager and block-based table. This format version includes changing the format of `TableProperties::compression_name`.
-
 ### Public API Changes
 * Change NewExternalTableFactory to return a unique_ptr instead of shared_ptr.
 * Add an optional min file size requirement for deletion triggered compaction. It can be specified when creating `CompactOnDeletionCollectorFactory`.
