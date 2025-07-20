@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <iostream>
 
 #include "port/port.h"
 #include "rocksdb/env.h"
@@ -35,6 +36,10 @@ class GenericRateLimiter : public RateLimiter {
 
   // This API allows user to dynamically change rate limiter's bytes per second.
   void SetBytesPerSecond(int64_t bytes_per_second) override;
+  void SetBytesPerSecond(std::vector<int64_t> bytes_per_second) override {
+    (void) bytes_per_second;
+    std::cout << "[TGRIGGS_LOG] Multi-tenant GenericRateLimiter::SetBytesPerSecond unimplemented\n";
+  };
 
   Status SetSingleBurstBytes(int64_t single_burst_bytes) override;
 
@@ -55,6 +60,11 @@ class GenericRateLimiter : public RateLimiter {
     return raw_single_burst_bytes;
   }
 
+  int64_t GetSingleBurstBytes(OpType op_type) const override {
+    (void) op_type;
+    return GetSingleBurstBytes();
+  }
+
   int64_t GetTotalBytesThrough(
       const Env::IOPriority pri = Env::IO_TOTAL) const override {
     MutexLock g(&request_mutex_);
@@ -67,6 +77,12 @@ class GenericRateLimiter : public RateLimiter {
     }
     return total_bytes_through_[pri];
   }
+
+  int64_t GetTotalBytesThroughForClient(int client_id) const override {
+    std::cout << "[TGRIGGS_LOG] Multi-tenant GenericRateLimiter::GetTotalBytesThroughForClient unimplemented\n";
+    (void) client_id;
+    return 0;
+  };
 
   int64_t GetTotalRequests(
       const Env::IOPriority pri = Env::IO_TOTAL) const override {
@@ -102,6 +118,10 @@ class GenericRateLimiter : public RateLimiter {
     return rate_bytes_per_sec_.load(std::memory_order_relaxed);
   }
 
+  RateLimiter* GetReadRateLimiter() override {
+    return nullptr;
+  }
+
   virtual void TEST_SetClock(std::shared_ptr<SystemClock> clock) {
     MutexLock g(&request_mutex_);
     clock_ = std::move(clock);
@@ -115,6 +135,8 @@ class GenericRateLimiter : public RateLimiter {
   int64_t CalculateRefillBytesPerPeriodLocked(int64_t rate_bytes_per_sec);
   Status TuneLocked();
   void SetBytesPerSecondLocked(int64_t bytes_per_second);
+
+  void TGprintStackTrace();
 
   uint64_t NowMicrosMonotonicLocked() {
     return clock_->NowNanos() / std::milli::den;
@@ -151,6 +173,9 @@ class GenericRateLimiter : public RateLimiter {
   int64_t num_drains_;
   const int64_t max_bytes_per_sec_;
   std::chrono::microseconds tuned_time_;
+
+  int calls_per_client_[4];
+  int total_calls_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

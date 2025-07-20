@@ -570,6 +570,8 @@ class DBImpl : public DB {
   void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
                                ColumnFamilyMetaData* metadata) override;
 
+  void GetCFMemTableStats() override;
+
   void GetAllColumnFamilyMetaData(
       std::vector<ColumnFamilyMetaData>* metadata) override;
 
@@ -969,6 +971,7 @@ class DBImpl : public DB {
   }
 
   const WriteController& write_controller() { return write_controller_; }
+  const std::vector<std::shared_ptr<WriteController>>& write_controllers() { return write_controllers_; }
 
   // hollow transactions shell used for recovery.
   // these will then be passed to TransactionDB so that
@@ -2200,6 +2203,9 @@ class DBImpl : public DB {
   Status DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
                     const WriteOptions& write_options);
 
+
+  void MultiTenantStallWrites();
+
   // Begin stalling of writes when memory usage increases beyond a certain
   // threshold.
   void WriteBufferManagerStallWrites();
@@ -2941,12 +2947,14 @@ class DBImpl : public DB {
   WriteThread nonmem_write_thread_;
 
   WriteController write_controller_;
+  std::vector<std::shared_ptr<WriteController>> write_controllers_;
 
   // Size of the last batch group. In slowdown mode, next write needs to
   // sleep if it uses up the quota.
   // Note: This is to protect memtable and compaction. If the batch only writes
   // to the WAL its size need not to be included in this.
   uint64_t last_batch_group_size_ = 0;
+  uint64_t last_batch_sizes_[2] = {0, 0};
 
   FlushScheduler flush_scheduler_;
 
@@ -3163,7 +3171,8 @@ class DBImpl : public DB {
   BlobFileCompletionCallback blob_callback_;
 
   // Pointer to WriteBufferManager stalling interface.
-  std::unique_ptr<StallInterface> wbm_stall_;
+  // std::unique_ptr<StallInterface> wbm_stall_;
+  std::vector<std::unique_ptr<StallInterface>> per_client_wbm_stall_;
 
   // seqno_to_time_mapping_ stores the sequence number to time mapping, it's not
   // thread safe, both read and write need db mutex hold.

@@ -15,6 +15,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <set>
+#include <map>
 
 #include "rocksdb/compression_type.h"
 #include "rocksdb/data_structure.h"
@@ -25,6 +27,17 @@ namespace ROCKSDB_NAMESPACE {
 class Cache;  // defined in advanced_cache.h
 struct ConfigOptions;
 class SecondaryCache;
+namespace lru_cache {
+  struct FairDBCacheMetadata {
+    int client_id;
+    std::atomic<size_t> capacity;
+    std::atomic<size_t> reserved_capacity;
+
+    std::atomic<uint64_t> hit_ctr;
+    std::atomic<uint64_t> miss_ctr;
+  };
+  class LRUCacheManager;
+}
 
 // These definitions begin source compatibility for a future change in which
 // a specific class for block cache is split away from general caches, so that
@@ -243,6 +256,16 @@ struct LRUCacheOptions : public ShardedCacheOptions {
   // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
   bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
 
+  bool fairdb_use_pooled = false;
+  size_t fairdb_reserved_space;
+  int client_id;
+
+  size_t pooled_capacity;
+  size_t request_additional_delay_microseconds;
+  size_t read_io_mbps;
+  size_t additional_rampups_supported;
+  lru_cache::LRUCacheManager* manager_ptr = nullptr;
+
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
                   bool _strict_capacity_limit, double _high_pri_pool_ratio,
@@ -250,20 +273,22 @@ struct LRUCacheOptions : public ShardedCacheOptions {
                   bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                   CacheMetadataChargePolicy _metadata_charge_policy =
                       kDefaultCacheMetadataChargePolicy,
-                  double _low_pri_pool_ratio = 0.0)
+                  double _low_pri_pool_ratio = 0.0,
+                  bool _fairdb_use_pooled=false)
       : ShardedCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
                             std::move(_memory_allocator),
                             _metadata_charge_policy),
         high_pri_pool_ratio(_high_pri_pool_ratio),
         low_pri_pool_ratio(_low_pri_pool_ratio),
-        use_adaptive_mutex(_use_adaptive_mutex) {}
+        use_adaptive_mutex(_use_adaptive_mutex),
+        fairdb_use_pooled(_fairdb_use_pooled) {}
 
   // Construct an instance of LRUCache using these options
   std::shared_ptr<Cache> MakeSharedCache() const;
 
   // Construct an instance of LRUCache for use as a row cache, typically for
   // `DBOptions::row_cache`. Some options are not relevant to row caches.
-  std::shared_ptr<RowCache> MakeSharedRowCache() const;
+std::shared_ptr<RowCache> MakeSharedRowCache() const;
 };
 
 // DEPRECATED wrapper function
@@ -285,6 +310,37 @@ inline std::shared_ptr<Cache> NewLRUCache(
 // DEPRECATED wrapper function
 inline std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
   return cache_opts.MakeSharedCache();
+}
+
+namespace lru_cache {
+  class LRUCache;
+  class FairDBCacheMetadata;
+  class LRUCacheManager {
+    public:
+      LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts);
+      ~LRUCacheManager ();
+      FairDBCacheMetadata* AddCache (int client_id);
+      FairDBCacheMetadata* GetElement (int client_id);
+      void IncrementAllocation (int client_id, size_t capacity);
+      size_t DecrementAllocation (int client_id, size_t capacity);
+      void MarkActiveUser (int client_id);
+
+      inline std::map<int, FairDBCacheMetadata*>* GetAllocations () { return caches; }
+      inline std::shared_ptr<LRUCache> GetMainCache () { return main_cache; }
+      inline size_t NumClients () { return caches->size(); }
+
+    private:
+      size_t caches_size;
+      void* manager_mutex_;
+      std::map<int, FairDBCacheMetadata*>* caches;
+      std::set<int> active_users;
+      std::shared_ptr<LRUCache> main_cache;
+      size_t current_reservation_standard_;
+      size_t num_active_users;
+      size_t request_additional_delay_microseconds;
+      size_t read_io_mbps;
+      size_t additional_bursting_supported;
+  };
 }
 
 // EXPERIMENTAL

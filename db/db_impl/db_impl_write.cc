@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cinttypes>
+#include <iostream>
 
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -17,6 +18,7 @@
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "rocksdb/tg_thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
 // Convenience methods
@@ -367,6 +369,25 @@ Status DBImpl::IngestWBWIAsMemtable(
   return s;
 }
 
+class IterationStopException : public std::exception {};
+class PutInspector : public rocksdb::WriteBatch::Handler {
+public:
+  virtual rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
+    (void) key;
+    (void) value;
+    column_family_id_ = column_family_id;
+    // std::cout << "Put Operation in CF " << column_family_id << " - Key: " << key.ToString() << std::endl;
+    throw IterationStopException();
+    return rocksdb::Status::OK();
+  }
+  uint32_t GetCFID() { return column_family_id_; }
+private:
+  uint32_t column_family_id_ = 99;
+};
+
+// The main write queue. This is the only write queue that updates LastSequence.
+// When using one write queue, the same sequence also indicates the last
+// published sequence.
 Status DBImpl::WriteImpl(const WriteOptions& write_options,
                          WriteBatch* my_batch, WriteCallback* callback,
                          UserWriteCallback* user_write_cb, uint64_t* wal_used,
@@ -549,6 +570,16 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                         /*_ingest_wbwi=*/wbwi != nullptr);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
+  // if (TG_GetThreadMetadata().client_id == 1) {
+  //   std::this_thread::sleep_for(std::chrono::seconds(1));
+  // }
+
+  if (write_buffer_manager_->ShouldStall(TG_GetThreadMetadata().client_id)) {
+    MultiTenantStallWrites();
+  }
+
+  // TODO(tgriggs): This is the write queue. Any stalling after thispoint
+  //                will affect all clients.
   write_thread_.JoinBatchGroup(&w);
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_CALLER) {
     write_thread_.SetMemWritersEachStride(&w);
@@ -627,6 +658,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     // with the other thread
 
     // PreprocessWrite does its own perf timing.
+    // TODO(tgriggs): This is where delays will occur
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
     status = PreprocessWrite(write_options, &wal_context, &write_context);
@@ -650,6 +682,32 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   if (wbwi) {
     assert(write_group.size == 1);
   }
+
+  // size_t num_cfs = 2;
+  // for (size_t i = 0; i < num_cfs; ++i) {
+  //   last_batch_sizes_[i] = 0;
+  // }
+  
+  // // size_t last_batch_sizes[num_cfs] = {0, 0};
+
+  // for (auto w_it = write_group.begin(); w_it != write_group.end(); ++w_it) {
+  //   rocksdb::WriteThread::Writer* cur_w = w_it.writer;
+  //   size_t batch_size = WriteBatchInternal::ByteSize(cur_w->batch);
+
+  //   PutInspector inspector;
+  //   try {
+  //     w.batch->Iterate(&inspector);
+  //   } catch (const IterationStopException& e) {
+  //     // Stopped iteration after a single Put(). That's enough to identify CF.
+  //   }
+  //   uint32_t cf_id = inspector.GetCFID();
+  //   last_batch_sizes_[cf_id] += batch_size;
+  //   // std::cout << "[TGRIGGS_LOG] batch size = " << batch_size << ", cf_id = " << cf_id << std::endl;
+  // }
+
+  // for (int i = 0; i < num_cfs; ++i) {
+  //   std::cout << "[TGRIGGS_LOG] cf_id=" << i << ", size=" << last_batch_sizes[i] << std::endl;
+  // }
 
   IOStatus io_s;
   Status pre_release_cb_status;
@@ -1542,6 +1600,10 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   PERF_TIMER_STOP(write_scheduling_flushes_compactions_time);
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
 
+  // TOD(tgriggs): DelayWrite --> what delay cases is this for? 
+    // Memtable count limit, L0 file limit, pending compactions will all trigger this
+  // Functionality: column family observes these triggers, calls SetupDelay
+  //                and GetDelayToken, which delays *all* column families
   if (UNLIKELY(status.ok() && (write_controller_.IsStopped() ||
                                write_controller_.NeedsDelay()))) {
     PERF_TIMER_STOP(write_pre_and_post_process_time);
@@ -1555,13 +1617,17 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     PERF_TIMER_START(write_pre_and_post_process_time);
   }
 
+  // TODo(tgriggs): WriteBufferManagerStallWrites --> what delay cases is this for? 
+    // This tracks *actual* memory usage.
+    // This could be the useful entrypoint to controlling memory usage for ALL clients.
+
   // If memory usage exceeded beyond a certain threshold,
   // write_buffer_manager_->ShouldStall() returns true to all threads writing to
   // all DBs and writers will be stalled.
   // It does soft checking because WriteBufferManager::buffer_limit_ has already
   // exceeded at this point so no new write (including current one) will go
   // through until memory usage is decreased.
-  if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldStall())) {
+  if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldStall(TG_GetThreadMetadata().client_id))) {
     default_cf_internal_stats_->AddDBStats(
         InternalStats::kIntStatsWriteBufferManagerLimitStopsCounts, 1,
         true /* concurrent */);
@@ -2302,27 +2368,43 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
   return s;
 }
 
+// Begins a stall on the current thread. Does not block other writer threads.
+void DBImpl::MultiTenantStallWrites() {
+  int client_id = TG_GetThreadMetadata().client_id;
+  std::unique_ptr<StallInterface>& wbm_stall = per_client_wbm_stall_[client_id];
+
+  // Change the state to State::Blocked.
+  static_cast<WBMStallInterface*>(wbm_stall.get())
+      ->SetState(WBMStallInterface::State::BLOCKED);
+
+  // Then WriteBufferManager will add this client's stall to its queue
+  // and wake it up once sufficient memory is available.
+  write_buffer_manager_->BeginWriteStall(wbm_stall.get(), client_id);
+  wbm_stall->Block();
+}
+
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
 void DBImpl::WriteBufferManagerStallWrites() {
-  mutex_.AssertHeld();
-  // First block future writer threads who want to add themselves to the queue
-  // of WriteThread.
-  write_thread_.BeginWriteStall();
-  mutex_.Unlock();
+  return;
+  // mutex_.AssertHeld();
+  // // First block future writer threads who want to add themselves to the queue
+  // // of WriteThread.
+  // write_thread_.BeginWriteStall();
+  // mutex_.Unlock();
 
-  // Change the state to State::Blocked.
-  static_cast<WBMStallInterface*>(wbm_stall_.get())
-      ->SetState(WBMStallInterface::State::BLOCKED);
-  // Then WriteBufferManager will add DB instance to its queue
-  // and block this thread by calling WBMStallInterface::Block().
-  write_buffer_manager_->BeginWriteStall(wbm_stall_.get());
-  wbm_stall_->Block();
+  // // Change the state to State::Blocked.
+  // static_cast<WBMStallInterface*>(wbm_stall_.get())
+  //     ->SetState(WBMStallInterface::State::BLOCKED);
+  // // Then WriteBufferManager will add DB instance to its queue
+  // // and block this thread by calling WBMStallInterface::Block().
+  // write_buffer_manager_->BeginWriteStall(wbm_stall_.get());
+  // wbm_stall_->Block();
 
-  mutex_.Lock();
-  // Stall has ended. Signal writer threads so that they can add
-  // themselves to the WriteThread queue for writes.
-  write_thread_.EndWriteStall();
+  // mutex_.Lock();
+  // // Stall has ended. Signal writer threads so that they can add
+  // // themselves to the WriteThread queue for writes.
+  // write_thread_.EndWriteStall();
 }
 
 Status DBImpl::ThrottleLowPriWritesIfNeeded(const WriteOptions& write_options,
@@ -2427,6 +2509,7 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
     flush_scheduler_.Clear();
   } else {
     ColumnFamilyData* tmp_cfd;
+    // TODO(tgriggs): getting error here
     while ((tmp_cfd = flush_scheduler_.TakeNextColumnFamily()) != nullptr) {
       cfds.push_back(tmp_cfd);
     }
@@ -2441,12 +2524,22 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   TEST_SYNC_POINT_CALLBACK("DBImpl::ScheduleFlushes:PreSwitchMemtable",
                            nullptr);
   for (auto& cfd : cfds) {
+
+    auto& thread_metadata = TG_GetThreadMetadata();
+    if (cfd->GetName().empty()) {
+      thread_metadata.client_id = -1;
+    } else if (cfd->GetName() == "default") {
+      thread_metadata.client_id = 0;
+    } else {
+      thread_metadata.client_id = std::stoi(cfd->GetName().substr(2));       
+    }
     if (status.ok() && !cfd->mem()->IsEmpty()) {
       status = SwitchMemtable(cfd, context);
     }
     if (cfd->UnrefAndTryDelete()) {
       cfd = nullptr;
     }
+    thread_metadata.client_id = -1;
   }
 
   if (two_write_queues_) {
@@ -2721,6 +2814,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
 
   cfd->mem()->SetNextLogNumber(cur_wal_number_);
   assert(new_mem != nullptr);
+  ROCKS_LOG_INFO(immutable_db_options_.info_log, "mt,%s,add", cfd->GetName().c_str());
   cfd->imm()->Add(cfd->mem(), &context->memtables_to_free_);
   if (new_imm) {
     // Need to assign memtable id here before SetMemtable() below assigns id to

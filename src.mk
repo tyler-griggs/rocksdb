@@ -237,6 +237,8 @@ LIB_SOURCES =                                                   \
   trace_replay/trace_replay.cc                                  \
   trace_replay/block_cache_tracer.cc                            \
   trace_replay/io_tracer.cc                                     \
+  util/tg_thread_local.cc					\
+  util/rate_limiter_multi_tenant.cc					\
   util/async_file_reader.cc					                            \
   util/auto_tune_compressor.cc                                           \
   util/build_version.cc                                         \

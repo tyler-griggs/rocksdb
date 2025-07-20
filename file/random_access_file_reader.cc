@@ -20,6 +20,7 @@
 #include "test_util/sync_point.h"
 #include "util/random.h"
 #include "util/rate_limiter_impl.h"
+#include "util/rate_limiter_multi_tenant_impl.h"
 
 namespace ROCKSDB_NAMESPACE {
 inline Histograms GetFileReadHistograms(Statistics* stats,
@@ -150,6 +151,7 @@ IOStatus RandomAccessFileReader::Read(const IOOptions& opts, uint64_t offset,
       AlignedBuffer buf;
       buf.Alignment(alignment);
       buf.AllocateNewBuffer(read_size);
+      // NOTE(tgriggs): This is where rate limiter is called in client reads.
       while (buf.CurrentSize() < read_size) {
         size_t allowed;
         if (rate_limiter_priority != Env::IO_TOTAL &&
@@ -416,7 +418,7 @@ IOStatus RandomAccessFileReader::MultiRead(const IOOptions& opts,
         size_t request_bytes = 0;
         while (remaining_bytes > 0) {
           request_bytes = std::min(
-              static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()),
+              static_cast<size_t>(rate_limiter_->GetSingleBurstBytes(RateLimiter::OpType::kRead)),
               remaining_bytes);
           rate_limiter_->Request(request_bytes, rate_limiter_priority,
                                  nullptr /* stats */,

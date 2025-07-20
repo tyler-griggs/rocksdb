@@ -10,6 +10,7 @@
 #include <limits>
 #include <queue>
 #include <string>
+#include <iostream>
 
 #include "db/db_impl/db_impl.h"
 #include "db/memtable.h"
@@ -801,6 +802,7 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
       }
 
       assert(m->file_number_ > 0);
+      ROCKS_LOG_BUFFER(log_buffer, "mt,%s,remove", cfd->GetName().c_str());
       current_->Remove(m, to_delete);
       UpdateCachedValuesFromMemTableListVersion();
       ResetTrimHistoryNeeded();

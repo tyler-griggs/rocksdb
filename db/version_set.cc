@@ -77,6 +77,7 @@
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
+#include "rocksdb/tg_thread_local.h"
 
 // Generate the regular and coroutine versions of some methods by
 // including version_set_sync_and_async.h twice
@@ -2460,6 +2461,15 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                 internal_comparator());
   FdWithKeyRange* f = fp.GetNextFile();
 
+  // Label the client ID for the read.
+  // TODO(tgriggs): Don't do string parsing on the fast path. Just make a lookup.
+  auto& thread_metadata = TG_GetThreadMetadata();
+  if (cfd_->GetName() == "default") {
+    thread_metadata.client_id = 0;
+  } else {
+    thread_metadata.client_id = std::stoi(cfd_->GetName().substr(2));       
+  }
+
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
       // The remaining files we look at will only contain covered keys, so we
@@ -2511,7 +2521,11 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           RecordTick(db_statistics_, GET_HIT_L0);
         } else if (fp.GetHitFileLevel() == 1) {
           RecordTick(db_statistics_, GET_HIT_L1);
-        } else if (fp.GetHitFileLevel() >= 2) {
+        } else if (fp.GetHitFileLevel() == 2) {
+          RecordTick(db_statistics_, GET_HIT_L2);
+        } else if (fp.GetHitFileLevel() == 3) {
+          RecordTick(db_statistics_, GET_HIT_L3);
+        } else if (fp.GetHitFileLevel() >= 4) {
           RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
         }
 
@@ -2604,6 +2618,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     *status = Status::NotFound();  // Use an empty error message for speed
   }
+  thread_metadata.client_id = -1;
 }
 
 void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
@@ -5164,13 +5179,14 @@ VersionSet::VersionSet(
     const std::string& dbname, const ImmutableDBOptions* _db_options,
     const FileOptions& storage_options, Cache* table_cache,
     WriteBufferManager* write_buffer_manager, WriteController* write_controller,
+    std::vector<std::shared_ptr<WriteController>> write_controllers,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
     const std::string& db_session_id, const std::string& daily_offpeak_time_utc,
     ErrorHandler* error_handler, bool unchanging)
     : column_family_set_(new ColumnFamilySet(
           dbname, _db_options, storage_options, table_cache,
-          write_buffer_manager, write_controller, block_cache_tracer, io_tracer,
+          write_buffer_manager, write_controller, write_controllers, block_cache_tracer, io_tracer,
           db_id, db_session_id)),
       table_cache_(table_cache),
       env_(_db_options->env),
@@ -5271,12 +5287,13 @@ void VersionSet::Reset() {
   if (column_family_set_) {
     WriteBufferManager* wbm = column_family_set_->write_buffer_manager();
     WriteController* wc = column_family_set_->write_controller();
+    std::vector<std::shared_ptr<WriteController>> wcs = column_family_set_->write_controllers();
     // db_id becomes the source of truth after DBImpl::Recover():
     // https://github.com/facebook/rocksdb/blob/v7.3.1/db/db_impl/db_impl_open.cc#L527
     // Note: we may not be able to recover db_id from MANIFEST if
     // options.write_dbid_to_manifest is false (default).
     column_family_set_.reset(new ColumnFamilySet(
-        dbname_, db_options_, file_options_, table_cache_, wbm, wc,
+        dbname_, db_options_, file_options_, table_cache_, wbm, wc, wcs,
         block_cache_tracer_, io_tracer_, db_id_, db_session_id_));
   }
   db_id_.clear();
@@ -6424,7 +6441,7 @@ Status VersionSet::ReduceNumberOfLevels(const std::string& dbname,
                                         options->table_cache_numshardbits));
   WriteController wc(options->delayed_write_rate);
   WriteBufferManager wb(options->db_write_buffer_size);
-  VersionSet versions(dbname, &db_options, file_options, tc.get(), &wb, &wc,
+  VersionSet versions(dbname, &db_options, file_options, tc.get(), &wb, &wc, std::vector<std::shared_ptr<WriteController>>(),
                       nullptr /*BlockCacheTracer*/, nullptr /*IOTracer*/,
                       /*db_id*/ "",
                       /*db_session_id*/ "", options->daily_offpeak_time_utc,
@@ -7482,7 +7499,7 @@ ReactiveVersionSet::ReactiveVersionSet(
     WriteBufferManager* write_buffer_manager, WriteController* write_controller,
     const std::shared_ptr<IOTracer>& io_tracer)
     : VersionSet(dbname, _db_options, _file_options, table_cache,
-                 write_buffer_manager, write_controller,
+                 write_buffer_manager, write_controller, std::vector<std::shared_ptr<WriteController>>(),
                  /*block_cache_tracer=*/nullptr, io_tracer, /*db_id*/ "",
                  /*db_session_id*/ "", /*daily_offpeak_time_utc*/ "",
                  /*error_handler=*/nullptr, /*unchanging=*/false) {}

@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/attribute_group_iterator_impl.h"
@@ -223,7 +224,12 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       atomic_flush_install_cv_(&mutex_),
       blob_callback_(immutable_db_options_.sst_file_manager.get(), &mutex_,
                      &error_handler_, &event_logger_,
-                     immutable_db_options_.listeners, dbname_) {
+                     immutable_db_options_.listeners, dbname_),
+      lock_wal_count_(0) {
+
+  for (int i = 0; i < 2; ++i) {
+    write_controllers_.push_back(std::make_shared<WriteController>(mutable_db_options_.delayed_write_rate));
+  }
   // !batch_per_trx_ implies seq_per_batch_ because it is only unset for
   // WriteUnprepared, which should use seq_per_batch_.
   assert(batch_per_txn_ || seq_per_batch_);
@@ -257,9 +263,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       PeriodicTaskType::kTriggerCompaction,
       [this]() { this->TriggerPeriodicCompaction(); });
 
+  // TODO(tgriggs): handle this write_controller_ to create multi-tenant stalls
   versions_.reset(new VersionSet(
       dbname_, &immutable_db_options_, file_options_, table_cache_.get(),
-      write_buffer_manager_, &write_controller_, &block_cache_tracer_,
+      write_buffer_manager_, &write_controller_, write_controllers_, &block_cache_tracer_,
       io_tracer_, db_id_, db_session_id_, options.daily_offpeak_time_utc,
       &error_handler_, read_only));
   column_family_memtables_.reset(
@@ -274,7 +281,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   max_total_wal_size_.store(mutable_db_options_.max_total_wal_size,
                             std::memory_order_relaxed);
   if (write_buffer_manager_) {
-    wbm_stall_.reset(new WBMStallInterface());
+    for (size_t i = 0; i < write_buffer_manager_->num_clients(); ++i){
+      per_client_wbm_stall_.emplace_back(new WBMStallInterface());
+    }
   }
 }
 
@@ -697,8 +706,10 @@ Status DBImpl::CloseHelper() {
     }
   }
 
-  if (write_buffer_manager_ && wbm_stall_) {
-    write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
+  if (write_buffer_manager_) {
+    for (size_t i = 0; i < write_buffer_manager_->num_clients(); ++i) {
+      write_buffer_manager_->RemoveDBFromQueue(per_client_wbm_stall_[i].get(), i);
+    }
   }
 
   IOStatus io_s = directories_.Close(IOOptions(), nullptr /* dbg */);
@@ -1197,7 +1208,11 @@ Status DBImpl::SetOptions(
   Status s;
   Status persist_options_status;
   SuperVersionContext sv_context(/* create_superversion */ true);
+
+  // TODO(tgriggs): this is the code block taking a long time
   {
+
+    // This code block takes about 3ms
     auto db_options = GetDBOptions();
     InstrumentedMutexLock l(&mutex_);
     // Manifest writers + Version appenders like flush and compaction use
@@ -1403,6 +1418,9 @@ Status DBImpl::SetDBOptions(
 
       write_controller_.set_max_delayed_write_rate(
           new_options.delayed_write_rate);
+      for (auto& wc : write_controllers_) {
+        wc->set_max_delayed_write_rate( new_options.delayed_write_rate);
+      }
       table_cache_.get()->SetCapacity(new_options.max_open_files == -1
                                           ? TableCache::kInfiniteCapacity
                                           : new_options.max_open_files - 10);
@@ -2325,7 +2343,7 @@ bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
 }
 
 Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
-                       GetImplOptions& get_impl_options) {
+                       GetImplOptions& get_impl_options) { 
   assert(get_impl_options.value != nullptr ||
          get_impl_options.merge_operands != nullptr ||
          get_impl_options.columns != nullptr);
@@ -5041,6 +5059,23 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
     cfd->current()->GetColumnFamilyMetaData(cf_meta);
+  }
+}
+
+void DBImpl::GetCFMemTableStats() {
+  InstrumentedMutexLock l(&mutex_);
+  for (auto cfd : *(versions_->GetColumnFamilySet())) {
+    {
+      std::cout << "memtables," << cfd->GetName() << "," 
+        << cfd->imm()->NumNotFlushed() + 1
+        << "," << (cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage()) / (1024*1024) << "MB\n";
+
+      // cfd->GetName();
+      // cfd->mem().size() + cfd->imm()->NumNotFlushed();
+
+      // cfd->mem()->ApproximateMemoryUsageFast() + cfd->imm()->ApproximateMemoryUsage();
+      // cfd->current()->GetColumnFamilyMetaData(&metadata->back());
+    }
   }
 }
 

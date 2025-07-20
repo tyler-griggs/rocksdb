@@ -17,10 +17,14 @@
 #include <cstddef>
 #include <list>
 #include <mutex>
-
+#include <vector>
+#include <iostream>
+#include <fstream>
 #include "rocksdb/cache.h"
+#include "rocksdb/tg_thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
+
 class CacheReservationManager;
 
 // Interface to block and signal DB instances, intended for RocksDB
@@ -37,19 +41,22 @@ class StallInterface {
 class WriteBufferManager final {
  public:
   // Parameters:
-  // _buffer_size: _buffer_size = 0 indicates no limit. Memory won't be capped.
-  // memory_usage() won't be valid and ShouldFlush() will always return true.
+  // buffer_size: buffer_size = 0 indicates no limit. Memory won't be capped.
+  // memory_usage() won't be valid and ShouldFlush() will always return false.
   //
-  // cache_: if `cache` is provided, we'll put dummy entries in the cache and
-  // cost the memory allocated to the cache. It can be used even if _buffer_size
+  // cache: if `cache` is provided, we'll put dummy entries in the cache and
+  // cost the memory allocated to the cache. It can be used even if buffer_size
   // = 0.
   //
   // allow_stall: if set true, it will enable stalling of writes when
   // memory_usage() exceeds buffer_size. It will wait for flush to complete and
   // memory usage to drop down.
-  explicit WriteBufferManager(size_t _buffer_size,
+  explicit WriteBufferManager(size_t buffer_size,
                               std::shared_ptr<Cache> cache = {},
-                              bool allow_stall = false);
+                              bool allow_stall = true,
+                              size_t num_clients = 16, 
+                              size_t steady_res_size = 0);
+
   // No copying allowed
   WriteBufferManager(const WriteBufferManager&) = delete;
   WriteBufferManager& operator=(const WriteBufferManager&) = delete;
@@ -66,7 +73,14 @@ class WriteBufferManager final {
   // Returns the total memory used by memtables.
   // Only valid if enabled()
   size_t memory_usage() const {
-    return memory_used_.load(std::memory_order_relaxed);
+    return global_used_.load(std::memory_order_relaxed) +
+           steady_res_used_.load(std::memory_order_relaxed);
+  }
+
+  // Returns the per-client memory usage.
+  size_t per_client_memory_usage(int client_id) const {
+    return per_client_global_used_[client_id].load(std::memory_order_relaxed) +
+           per_client_steady_res_used_[client_id].load(std::memory_order_relaxed);
   }
 
   // Returns the total memory used by active memtables.
@@ -81,11 +95,38 @@ class WriteBufferManager final {
     return buffer_size_.load(std::memory_order_relaxed);
   }
 
+  size_t num_clients() const {
+    return per_client_global_used_.size();
+  }
+
+  // Sets the per-client buffer size (memory usage threshold) for stalling.
+  void SetPerClientBufferSize(int client_id, size_t buffer_size);
+
+  // Set the steady reservation size and adjust global pool size accordingly.
+  void SetSteadyReservationSize(size_t steady_size);
+
+  // Mark a client as steady or non-steady.
+  void SetClientAsSteady(int client_id, bool is_steady);
+
+  // Get per-client global pool usage.
+  size_t per_client_global_usage(int client_id) const;
+
+  // Get per-client steady pool usage.
+  size_t per_client_steady_usage(int client_id) const;
+
+  // Get aggregate global pool usage.
+  size_t aggregate_global_usage() const;
+
+  // Get aggregate steady pool usage.
+  size_t aggregate_steady_usage() const;
+
   // REQUIRED: `new_size` > 0
   void SetBufferSize(size_t new_size) {
     assert(new_size > 0);
     buffer_size_.store(new_size, std::memory_order_relaxed);
     mutable_limit_.store(new_size * 7 / 8, std::memory_order_relaxed);
+    // Adjust global and steady pool sizes
+    global_size_ = buffer_size_ - steady_res_size_;
     // Check if stall is active and can be ended.
     MaybeEndWriteStall();
   }
@@ -107,9 +148,9 @@ class WriteBufferManager final {
       size_t local_size = buffer_size();
       if (memory_usage() >= local_size &&
           mutable_memtable_memory_usage() >= local_size / 2) {
-        // If the memory exceeds the buffer size, we trigger more aggressive
-        // flush. But if already more than half memory is being flushed,
-        // triggering more flush may not help. We will hold it instead.
+      // If the memory exceeds the buffer size, we trigger more aggressive
+      // flush. But if already more than half memory is being flushed,
+      // triggering more flush may not help. We will hold it instead.
         return true;
       }
     }
@@ -117,29 +158,21 @@ class WriteBufferManager final {
   }
 
   // Returns true if total memory usage exceeded buffer_size.
-  // We stall the writes untill memory_usage drops below buffer_size. When the
-  // function returns true, all writer threads (including one checking this
-  // condition) across all DBs will be stalled. Stall is allowed only if user
-  // pass allow_stall = true during WriteBufferManager instance creation.
+  // We stall the writes until memory_usage drops below buffer_size. When the
+  // function returns true, the writer thread for the given client will be stalled.
+  // Stall is allowed only if user passes allow_stall = true during
+  // WriteBufferManager instance creation.
   //
-  // Should only be called by RocksDB internally .
-  bool ShouldStall() const {
-    if (!allow_stall_.load(std::memory_order_relaxed) || !enabled()) {
-      return false;
-    }
+  // Should only be called by RocksDB internally.
+  bool ShouldStall(int client_id) const;
 
-    return IsStallActive() || IsStallThresholdExceeded();
+  // Returns true if stall is active for the given client.
+  bool IsStallActive(int client_id) const {
+    return per_client_stall_active_[client_id].load(std::memory_order_relaxed);
   }
 
-  // Returns true if stall is active.
-  bool IsStallActive() const {
-    return stall_active_.load(std::memory_order_relaxed);
-  }
-
-  // Returns true if stalling condition is met.
-  bool IsStallThresholdExceeded() const {
-    return memory_usage() >= buffer_size_;
-  }
+  // Returns true if stalling condition is met for the given client.
+  bool IsStallThresholdExceeded(int client_id) const;
 
   void ReserveMem(size_t mem);
 
@@ -149,35 +182,53 @@ class WriteBufferManager final {
 
   void FreeMem(size_t mem);
 
-  // Add the DB instance to the queue and block the DB.
+  // Add the DB instance to the per-client queue and block the DB.
   // Should only be called by RocksDB internally.
-  void BeginWriteStall(StallInterface* wbm_stall);
+  void BeginWriteStall(StallInterface* wbm_stall, int client_id);
 
   // If stall conditions have resolved, remove DB instances from queue and
   // signal them to continue.
   void MaybeEndWriteStall();
 
-  void RemoveDBFromQueue(StallInterface* wbm_stall);
+  void RemoveDBFromQueue(StallInterface* wbm_stall, int client_id);
 
  private:
   std::atomic<size_t> buffer_size_;
   std::atomic<size_t> mutable_limit_;
-  std::atomic<size_t> memory_used_;
-  // Memory that hasn't been scheduled to free.
+
+  // Global Pool
+  size_t global_size_;
+  std::atomic<size_t> global_used_;
+  std::vector<std::atomic<size_t>> per_client_global_used_;
+
+  // Steady Reservation Pool
+  size_t steady_res_size_;
+  std::vector<bool> per_client_is_steady_;
+  std::atomic<size_t> steady_res_used_;
+  std::vector<std::atomic<size_t>> per_client_steady_res_used_;
+
+  std::vector<size_t> per_client_buffer_size_;
+
   std::atomic<size_t> memory_active_;
   std::shared_ptr<CacheReservationManager> cache_res_mgr_;
-  // Protects cache_res_mgr_
   std::mutex cache_res_mgr_mu_;
 
-  std::list<StallInterface*> queue_;
-  // Protects the queue_ and stall_active_.
+  std::vector<std::list<StallInterface*>> per_client_queue_;
+  
+  // Protects the per-client queues and stall_active_ flags.
   std::mutex mu_;
   std::atomic<bool> allow_stall_;
   // Value should only be changed by BeginWriteStall() and MaybeEndWriteStall()
   // while holding mu_, but it can be read without a lock.
-  std::atomic<bool> stall_active_;
+  std::vector<std::atomic<bool>> per_client_stall_active_;
+
+  std::ofstream mt_log_file_;
+
+  std::vector<std::atomic<size_t>> per_client_stall_count_;
+  std::atomic<int> total_stall_count_;
 
   void ReserveMemWithCache(size_t mem);
   void FreeMemWithCache(size_t mem);
 };
+
 }  // namespace ROCKSDB_NAMESPACE

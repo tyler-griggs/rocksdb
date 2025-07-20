@@ -30,6 +30,7 @@
 #include "util/coding.h"
 #include "util/concurrent_task_limiter_impl.h"
 #include "util/udt_util.h"
+#include "rocksdb/tg_thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -285,6 +286,15 @@ Status DBImpl::FlushMemTableToOutputFile(
   // Note that flush_job.Run will unlock and lock the db_mutex,
   // and EventListener callback will be called when the db_mutex
   // is unlocked by the current thread.
+
+  // TODO(tgriggs): Super hacky. Update code to use cfd->GetID()
+  // auto& thread_metadata = TG_GetThreadMetadata();
+  // if (cfd->GetName() == "default") {
+  //   thread_metadata.client_id = 0;
+  // } else {
+  //   thread_metadata.client_id = std::stoi(cfd->GetName().substr(2));       
+  // }
+
   if (s.ok()) {
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
                       &switched_to_mempurge, &skip_set_bg_error,
@@ -355,6 +365,10 @@ Status DBImpl::FlushMemTableToOutputFile(
       error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
     }
   }
+
+  // // Reset the thread metadata.
+  // thread_metadata.client_id = 0;
+
   // If flush ran smoothly and no mempurge happened
   // install new SST file path.
   if (s.ok() && (!switched_to_mempurge)) {
@@ -392,9 +406,17 @@ Status DBImpl::FlushMemTablesToOutputFiles(
     return AtomicFlushMemTablesToOutputFiles(
         bg_flush_args, made_progress, job_context, log_buffer, thread_pri);
   }
+  // Only one flush arg --> only one CF
   assert(bg_flush_args.size() == 1);
   InitSnapshotContext(job_context);
 
+  auto& thread_metadata = TG_GetThreadMetadata();
+  std::string cf_name = bg_flush_args[0].cfd_->GetName();
+  if (cf_name == "default") {
+    thread_metadata.client_id = 0;
+  } else {
+    thread_metadata.client_id = std::stoi(cf_name.substr(2));       
+  }
   const auto& bg_flush_arg = bg_flush_args[0];
   ColumnFamilyData* cfd = bg_flush_arg.cfd_;
   // intentional infrequent copy for each flush
@@ -3301,9 +3323,10 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
   for (auto cfd : column_families_not_to_flush) {
     cfd->UnrefAndTryDelete();
   }
+
   return status;
 }
-
+// TODO(tgriggs): here is where memtable is cleared
 void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
   bool made_progress = false;
   JobContext job_context(next_job_id_.fetch_add(1), true);
@@ -3380,7 +3403,12 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       if (job_context.HaveSomethingToDelete()) {
         PurgeObsoleteFiles(job_context);
       }
+      // Memtable memory is cleared here.
       job_context.Clean();
+
+      // Reset the thread metadata.
+      TG_GetThreadMetadata().client_id = -1;
+
       mutex_.Lock();
     }
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");

@@ -40,6 +40,9 @@ class RateLimiter {
   // REQUIRED: bytes_per_second > 0
   virtual void SetBytesPerSecond(int64_t bytes_per_second) = 0;
 
+  // Set bytes_per_second at a per-client level. 
+  virtual void SetBytesPerSecond(std::vector<int64_t> bytes_per_second) = 0;
+
   // This API allows user to dynamically change the max bytes can be granted in
   // a single call to `Request()`. Zero is a special value meaning the number of
   // bytes per refill.
@@ -96,10 +99,14 @@ class RateLimiter {
 
   // Max bytes can be granted in a single call to `Request()`.
   virtual int64_t GetSingleBurstBytes() const = 0;
+  virtual int64_t GetSingleBurstBytes(OpType op_type) const = 0; 
 
   // Total bytes that go through rate limiter
   virtual int64_t GetTotalBytesThrough(
       const Env::IOPriority pri = Env::IO_TOTAL) const = 0;
+
+  // Total bytes that go through rate limiter for given client.
+  virtual int64_t GetTotalBytesThroughForClient(int client_id) const = 0;
 
   // Total # of requests that go through rate limiter
   virtual int64_t GetTotalRequests(
@@ -120,6 +127,9 @@ class RateLimiter {
   }
 
   virtual int64_t GetBytesPerSecond() const = 0;
+
+  // TODO(tgriggs): remove this when we separate RLs
+  virtual RateLimiter* GetReadRateLimiter() = 0;
 
   virtual bool IsRateLimited(OpType op_type) {
     if ((mode_ == RateLimiter::Mode::kWritesOnly &&
@@ -168,5 +178,16 @@ RateLimiter* NewGenericRateLimiter(
     int32_t fairness = 10,
     RateLimiter::Mode mode = RateLimiter::Mode::kWritesOnly,
     bool auto_tuned = false, int64_t single_burst_bytes = 0);
+
+RateLimiter* NewMultiTenantRateLimiter(
+    int num_clients /* = 1 */,
+    std::vector<int64_t> bytes_per_sec,
+    std::vector<int64_t> read_bytes_per_sec,
+    int64_t refill_period_us /* = 100 * 1000 */,
+    int32_t fairness /* = 10 */,
+    RateLimiter::Mode mode /* = RateLimiter::Mode::kWritesOnly */,
+    int64_t single_burst_bytes /* = 0 */);
+
+class MultiTenantRateLimiter;
 
 }  // namespace ROCKSDB_NAMESPACE
